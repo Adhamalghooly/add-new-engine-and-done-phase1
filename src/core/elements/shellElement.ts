@@ -22,12 +22,15 @@
  *   MEMBRANE_ONLY → membrane terms only, zero bending/shear
  *   REDUCED       → K = factor × K_full
  *
- * Integration: 2×2 Gauss for bending, 1×1 reduced for shear (locking-free).
+ * Integration: 2×2 Gauss for bending+membrane, 1×1 reduced for shear (locking-free).
+ *
+ * AUDIT NOTE: Assembly uses direct index assignment (not addK symmetry helper)
+ * to avoid double-counting when iterating node pairs.
  */
 
-import type { StructuralNode, Material, SlabProperties } from '../model/types';
+import type { Material, SlabProperties } from '../model/types';
 
-// Gauss points
+// Gauss points for 2-point quadrature
 const GP2 = [-1 / Math.sqrt(3), 1 / Math.sqrt(3)];
 const GW2 = [1.0, 1.0];
 
@@ -58,7 +61,7 @@ export function buildShellStiffness(
     ? (slabProps.stiffnessFactor ?? 1.0)
     : 1.0;
 
-  // ── Membrane stiffness (plane stress) ──
+  // ── Membrane constitutive: plane stress ──
   // Dm = Et/(1-ν²) × [[1,ν,0],[ν,1,0],[0,0,(1-ν)/2]]
   const Dm_coeff = E * t / (1 - nu * nu);
   const Dm = [
@@ -67,7 +70,7 @@ export function buildShellStiffness(
     0, 0, Dm_coeff * (1 - nu) / 2,
   ];
 
-  // ── Bending stiffness ──
+  // ── Bending constitutive ──
   // Db = Et³/(12(1-ν²)) × [[1,ν,0],[ν,1,0],[0,0,(1-ν)/2]]
   const Db_coeff = E * t * t * t / (12 * (1 - nu * nu));
   const Db = [
@@ -76,17 +79,17 @@ export function buildShellStiffness(
     0, 0, Db_coeff * (1 - nu) / 2,
   ];
 
-  // ── Shear stiffness ──
-  const ks = 5 / 6;
+  // ── Shear constitutive ──
+  const ks = 5 / 6; // shear correction factor for Mindlin plate
   const Ds_coeff = ks * G * t;
 
   // Node coordinates in element (4 nodes)
-  const x = nodeCoords.map(n => n.x);
-  const y = nodeCoords.map(n => n.y);
+  const x = nodeCoords.map(nd => nd.x);
+  const y = nodeCoords.map(nd => nd.y);
 
   // Shape function derivatives in natural coordinates
+  // 4-node isoparametric quad: N_i = (1 ± ξ)(1 ± η)/4
   function shapeFuncDerivs(xi: number, eta: number) {
-    // dN/dξ, dN/dη for 4-node quad
     const dNdxi = [
       -(1 - eta) / 4, (1 - eta) / 4, (1 + eta) / 4, -(1 + eta) / 4,
     ];
@@ -105,6 +108,7 @@ export function buildShellStiffness(
     ];
   }
 
+  // Jacobian: J = [∂x/∂ξ, ∂y/∂ξ; ∂x/∂η, ∂y/∂η]
   function jacobian(dNdxi: number[], dNdeta: number[]) {
     let J11 = 0, J12 = 0, J21 = 0, J22 = 0;
     for (let i = 0; i < 4; i++) {
@@ -120,12 +124,6 @@ export function buildShellStiffness(
     };
   }
 
-  // Helper to add to K
-  const addK = (i: number, j: number, v: number) => {
-    K[i * n + j] += v;
-    if (i !== j) K[j * n + i] += v;
-  };
-
   // ── 2×2 Gauss integration (membrane + bending) ──
   for (let gi = 0; gi < 2; gi++) {
     for (let gj = 0; gj < 2; gj++) {
@@ -136,7 +134,7 @@ export function buildShellStiffness(
       const { dNdxi, dNdeta } = shapeFuncDerivs(xi, eta);
       const { detJ, invJ } = jacobian(dNdxi, dNdeta);
 
-      // dN/dx, dN/dy in physical coords
+      // dN/dx, dN/dy in physical coords via inverse Jacobian
       const dNdx: number[] = [];
       const dNdy: number[] = [];
       for (let i = 0; i < 4; i++) {
@@ -146,66 +144,56 @@ export function buildShellStiffness(
 
       const wdetJ = w * Math.abs(detJ);
 
-      // DOF mapping per node: [ux, uy, uz, rx, ry, rz] → indices 0-5
-      // Global DOF for node i: base = i * 6
-
       // ── Membrane: Bm^T · Dm · Bm ──
-      // Bm for node i: [[dNdx, 0], [0, dNdy], [dNdy, dNdx]] on DOF [ux, uy]
+      // Bm(a) = [[dNa/dx, 0], [0, dNa/dy], [dNa/dy, dNa/dx]]
+      // on DOF [ux(0), uy(1)]
       for (let a = 0; a < 4; a++) {
-        for (let b = a; b < 4; b++) {
+        for (let b = 0; b < 4; b++) {
           const ai = a * 6;
-          const bi = b * 6;
+          const bi2 = b * 6;
 
-          // Km contributions (3×3 membrane Bm^T·Dm·Bm per node pair)
-          // Row 0: dNa/dx · D11 · dNb/dx + dNa/dy · D33 · dNb/dy
+          // K(ux_a, ux_b)
           const k00 = (dNdx[a] * Dm[0] * dNdx[b] + dNdy[a] * Dm[8] * dNdy[b]) * wdetJ;
+          // K(ux_a, uy_b)
           const k01 = (dNdx[a] * Dm[1] * dNdy[b] + dNdy[a] * Dm[8] * dNdx[b]) * wdetJ;
+          // K(uy_a, uy_b)
           const k11 = (dNdy[a] * Dm[4] * dNdy[b] + dNdx[a] * Dm[8] * dNdx[b]) * wdetJ;
 
-          addK(ai + 0, bi + 0, k00);
-          addK(ai + 0, bi + 1, k01);
-          addK(ai + 1, bi + 1, k11);
-
-          if (a !== b) {
-            addK(bi + 0, ai + 0, k00);
-            addK(bi + 0, ai + 1, k01);
-            addK(bi + 1, ai + 1, k11);
-          }
+          K[(ai + 0) * n + (bi2 + 0)] += k00;
+          K[(ai + 0) * n + (bi2 + 1)] += k01;
+          K[(ai + 1) * n + (bi2 + 0)] += (dNdy[a] * Dm[1] * dNdx[b] + dNdx[a] * Dm[8] * dNdy[b]) * wdetJ;
+          K[(ai + 1) * n + (bi2 + 1)] += k11;
         }
       }
 
       // ── Bending: Bb^T · Db · Bb (only if bending included) ──
       if (includeBending) {
-        // Bb for node i on DOF [rx, ry]:
-        //   κx  = -dNi/dx · θy  → row 0, col ry (DOF 4)
-        //   κy  =  dNi/dy · θx  → row 1, col rx (DOF 3)
-        //   κxy =  dNi/dx · θx - dNi/dy · θy → row 2
+        // Bb(a) = [[0, -dNa/dx], [dNa/dy, 0], [dNa/dx, -dNa/dy]]
+        // on DOF [rx(3), ry(4)]
+        // κx = -∂θy/∂x, κy = ∂θx/∂y, κxy = ∂θx/∂x - ∂θy/∂y
         for (let a = 0; a < 4; a++) {
-          for (let b = a; b < 4; b++) {
+          for (let b = 0; b < 4; b++) {
             const ai = a * 6;
-            const bi = b * 6;
+            const bi2 = b * 6;
 
-            // θy-θy (DOF 4-4): (-dNa/dx)·Db11·(-dNb/dx) + (dNa/dy)·Db33·(dNb/dy) ... wait
-            // Let's compute Bb^T·Db·Bb properly
-            // Bb(a) = [0, -dNa/dx; dNa/dy, 0; dNa/dx, -dNa/dy]  for [rx, ry]
-            //        col: rx(3), ry(4)
+            // Bb(a)^T·Db·Bb(b) components:
+            // (rx_a, rx_b): row1·D·row1 + row2·D·row2 for rx terms
+            // Bb[0,rx]=0, Bb[1,rx]=dNa/dy, Bb[2,rx]=dNa/dx
+            // Bb[0,ry]=-dNa/dx, Bb[1,ry]=0, Bb[2,ry]=-dNa/dy
 
-            // (rx_a, rx_b):  Bb[1,0]*Db[1,1]*Bb[1,0] + Bb[2,0]*Db[2,2]*Bb[2,0]
+            // K(rx_a, rx_b) = dNa/dy*Db[4]*dNb/dy + dNa/dx*Db[8]*dNb/dx
             const rxrx = (dNdy[a] * Db[4] * dNdy[b] + dNdx[a] * Db[8] * dNdx[b]) * wdetJ;
-            // (rx_a, ry_b):  Bb[1,0]*Db[1,0]*Bb[0,1] + Bb[2,0]*Db[2,2]*Bb[2,1]
+            // K(rx_a, ry_b) = dNa/dy*Db[3]*(-dNb/dx) + dNa/dx*Db[8]*(-dNb/dy)
             const rxry = (dNdy[a] * Db[3] * (-dNdx[b]) + dNdx[a] * Db[8] * (-dNdy[b])) * wdetJ;
-            // (ry_a, ry_b):  Bb[0,1]*Db[0,0]*Bb[0,1] + Bb[2,1]*Db[2,2]*Bb[2,1]
-            const ryry = ((-dNdx[a]) * Db[0] * (-dNdx[b]) + (-dNdy[a]) * Db[8] * (-dNdy[b])) * wdetJ;
+            // K(ry_a, rx_b) = (-dNa/dx)*Db[1]*dNb/dy + (-dNa/dy)*Db[8]*dNb/dx
+            const ryrx = ((-dNdx[a]) * Db[1] * dNdy[b] + (-dNdy[a]) * Db[8] * dNdx[b]) * wdetJ;
+            // K(ry_a, ry_b) = (-dNa/dx)*Db[0]*(-dNb/dx) + (-dNa/dy)*Db[8]*(-dNb/dy)
+            const ryry = (dNdx[a] * Db[0] * dNdx[b] + dNdy[a] * Db[8] * dNdy[b]) * wdetJ;
 
-            addK(ai + 3, bi + 3, rxrx);
-            addK(ai + 3, bi + 4, rxry);
-            addK(ai + 4, bi + 4, ryry);
-
-            if (a !== b) {
-              addK(bi + 3, ai + 3, rxrx);
-              addK(bi + 3, ai + 4, rxry);
-              addK(bi + 4, ai + 4, ryry);
-            }
+            K[(ai + 3) * n + (bi2 + 3)] += rxrx;
+            K[(ai + 3) * n + (bi2 + 4)] += rxry;
+            K[(ai + 4) * n + (bi2 + 3)] += ryrx;
+            K[(ai + 4) * n + (bi2 + 4)] += ryry;
           }
         }
       }
@@ -228,39 +216,37 @@ export function buildShellStiffness(
 
     const wdetJ = 4.0 * Math.abs(detJ); // weight = 2×2 = 4 for single point
 
-    // Bs for node i: γxz = dNi/dx · uz + Ni · ry → [dNdx, 0, Ni] on [uz(2), rx(3), ry(4)]
-    //                γyz = dNi/dy · uz - Ni · rx → [dNdy, -Ni, 0]
+    // Bs for node i:
+    //   γxz = ∂uz/∂x + θy → Bs_xz = [dNi/dx, 0, Ni] on [uz(2), rx(3), ry(4)]
+    //   γyz = ∂uz/∂y − θx → Bs_yz = [dNi/dy, -Ni, 0]
     for (let a = 0; a < 4; a++) {
-      for (let b = a; b < 4; b++) {
+      for (let b = 0; b < 4; b++) {
         const ai = a * 6;
-        const bi = b * 6;
+        const bi2 = b * 6;
 
-        // Ds * Bs^T · Bs
-        // uz-uz: Ds*(dNa/dx·dNb/dx + dNa/dy·dNb/dy)
+        // K(uz_a, uz_b) = Ds*(dNa/dx*dNb/dx + dNa/dy*dNb/dy)
         const uzuz = Ds_coeff * (dNdx[a] * dNdx[b] + dNdy[a] * dNdy[b]) * wdetJ;
-        // uz-rx: Ds*(-dNa/dy·Nb) ... from γyz
+        // K(uz_a, rx_b) = Ds*(-dNa/dy*Nb) from γyz
         const uzrx = Ds_coeff * (dNdy[a] * (-N[b])) * wdetJ;
-        // uz-ry: Ds*(dNa/dx·Nb) ... from γxz
+        // K(uz_a, ry_b) = Ds*(dNa/dx*Nb) from γxz
         const uzry = Ds_coeff * (dNdx[a] * N[b]) * wdetJ;
-        // rx-rx: Ds*(Na·Nb) from γyz
+        // K(rx_a, uz_b) = Ds*(-Na*dNb/dy) from γyz
+        const rxuz = Ds_coeff * ((-N[a]) * dNdy[b]) * wdetJ;
+        // K(rx_a, rx_b) = Ds*(Na*Nb) from γyz
         const rxrx = Ds_coeff * (N[a] * N[b]) * wdetJ;
-        // ry-ry: Ds*(Na·Nb) from γxz
+        // K(rx_a, ry_b) = 0 (no cross-term)
+        // K(ry_a, uz_b) = Ds*(Na*dNb/dx) from γxz
+        const ryuz = Ds_coeff * (N[a] * dNdx[b]) * wdetJ;
+        // K(ry_a, ry_b) = Ds*(Na*Nb) from γxz
         const ryry = Ds_coeff * (N[a] * N[b]) * wdetJ;
-        // rx-ry: 0
 
-        addK(ai + 2, bi + 2, uzuz);
-        addK(ai + 2, bi + 3, uzrx);
-        addK(ai + 2, bi + 4, uzry);
-        addK(ai + 3, bi + 3, rxrx);
-        addK(ai + 4, bi + 4, ryry);
-
-        if (a !== b) {
-          addK(bi + 2, ai + 2, uzuz);
-          addK(bi + 2, ai + 3, uzrx);
-          addK(bi + 2, ai + 4, uzry);
-          addK(bi + 3, ai + 3, rxrx);
-          addK(bi + 4, ai + 4, ryry);
-        }
+        K[(ai + 2) * n + (bi2 + 2)] += uzuz;
+        K[(ai + 2) * n + (bi2 + 3)] += uzrx;
+        K[(ai + 2) * n + (bi2 + 4)] += uzry;
+        K[(ai + 3) * n + (bi2 + 2)] += rxuz;
+        K[(ai + 3) * n + (bi2 + 3)] += rxrx;
+        K[(ai + 4) * n + (bi2 + 2)] += ryuz;
+        K[(ai + 4) * n + (bi2 + 4)] += ryry;
       }
     }
   }
